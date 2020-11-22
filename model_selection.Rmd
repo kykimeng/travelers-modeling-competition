@@ -1,0 +1,227 @@
+---
+title: "2020 Travelers Modeling Competition"
+author: "Kim Eng Ky"
+date: "`r format(Sys.Date(), '%b %d, %Y')`"
+output: html_document
+editor_options: 
+  chunk_output_type: console
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE, warning = F, message = F)
+library(tidyverse)
+library(grid)
+library(gridExtra)
+library(pscl)
+library(rsample)
+library(data.table)
+
+theme_set(theme_bw())
+
+# train_set <- read_csv("InsNova_train.csv")
+# set.seed(8051)
+# set_split <- initial_split(train_set, prob = 0.75)
+# train <- training(set_split)
+# write_csv(train, "group2_trainset.csv")
+# eval_set <- testing(set_split)
+# write_csv(eval_set, "group2_testset.csv")
+train_set <- fread("group2_trainset.csv")
+eval_set <- fread("group2_testset.csv")
+
+test_set <- read_csv("InsNova_test.csv")
+```
+
+# feature engineering
+
+```{r}
+library(tidymodels)
+library(parsnip)
+
+step_recipe <- recipe(claim_ind ~ veh_value + exposure + veh_body + veh_age + gender + area + dr_age,
+                      data = train_set) %>% 
+  step_num2factor(claim_ind, transform = function(x) x + 1, levels = c('no', 'yes')) %>% 
+  step_log(veh_value, offset = 1) %>% 
+  step_dummy(all_nominal(), -claim_ind) %>% 
+  step_interact(~ starts_with("veh_body"):starts_with("gender") + 
+                  starts_with("veh_body"):starts_with("area") +
+                  starts_with("veh_body"):veh_value + 
+                  starts_with("veh_body"):exposure +
+                  starts_with("veh_body"):veh_age + 
+                  starts_with("veh_body"):dr_age +
+                  starts_with("gender"):starts_with("area") + 
+                  starts_with("gender"):veh_value +
+                  starts_with("gender"):exposure + 
+                  starts_with("gender"):veh_age +
+                  starts_with("gender"):dr_age + 
+                  starts_with("area"):veh_value +
+                  starts_with("area"):exposure + 
+                  starts_with("area"):veh_age + 
+                  starts_with("area"):dr_age +
+                  veh_value:exposure + 
+                  veh_value:veh_age + 
+                  veh_value:dr_age + 
+                  exposure:veh_age +
+                  exposure:dr_age + 
+                  veh_age:dr_age) %>% 
+  step_poly(veh_value, exposure, veh_age, dr_age) 
+
+step_prep <- prep(step_recipe, training = train_set)
+train_prep <- juice(step_prep)
+test_prep <- bake(step_prep, new_data = eval_set)
+
+# for logistic regression
+step_recipe_binary <- recipe(claim_ind ~ veh_value + exposure + veh_body + veh_age + gender + area + dr_age,
+                             data = train_set) %>% 
+  step_log(veh_value, offset = 1) %>% 
+  step_dummy(all_nominal(), -claim_ind) %>% 
+  step_interact(~ starts_with("veh_body"):starts_with("gender") + 
+                  starts_with("veh_body"):starts_with("area") +
+                  starts_with("veh_body"):veh_value + 
+                  starts_with("veh_body"):exposure +
+                  starts_with("veh_body"):veh_age + 
+                  starts_with("veh_body"):dr_age +
+                  starts_with("gender"):starts_with("area") + 
+                  starts_with("gender"):veh_value +
+                  starts_with("gender"):exposure + 
+                  starts_with("gender"):veh_age +
+                  starts_with("gender"):dr_age + 
+                  starts_with("area"):veh_value +
+                  starts_with("area"):exposure + 
+                  starts_with("area"):veh_age + 
+                  starts_with("area"):dr_age +
+                  veh_value:exposure + 
+                  veh_value:veh_age + 
+                  veh_value:dr_age + 
+                  exposure:veh_age +
+                  exposure:dr_age + 
+                  veh_age:dr_age) %>% 
+  step_poly(veh_value, exposure, veh_age, dr_age) 
+
+step_prep_binary <- prep(step_recipe_binary, training = train_set)
+train_prep_binary <- juice(step_prep_binary)
+test_prep_binary <- bake(step_prep_binary, new_data = eval_set)
+```
+
+# variable selection
+
+## first step - binary outcome
+
+```{r}
+library(randomForest)
+m0 <- randomForest(claim_ind ~ ., data = train_prep)
+imp <- importance(m0)
+df <- data.frame(imp = unname(imp), var = rownames(imp))
+
+# ggplot(df[1:100,]) + 
+#   geom_point(aes(x = imp, y = fct_reorder(var, imp)))
+
+# only keep variables with MeanDecreaseGini of at least 5
+selected_vars <- df %>% filter(imp >= 5) %>% pull(var)
+
+train_prep <- train_prep %>% select(selected_vars, claim_ind)
+train_prep_binary <- train_prep_binary %>% select(selected_vars, claim_ind)
+set.seed(8051)
+cv_set <- vfold_cv(train_prep, strata = "claim_ind")
+set.seed(8051)
+cv_set_binary <- vfold_cv(train_prep_binary, strata = "claim_ind")
+test_prep <- test_prep %>% select(selected_vars, claim_ind)
+test_prep_binary <- test_prep_binary %>% select(selected_vars, claim_ind)
+```
+
+# logistic regression
+
+```{r}
+library(glmnet)
+require(doMC)
+registerDoMC(cores = 3)
+x <- train_prep %>% select(-claim_ind) %>% as.matrix()
+y <- train_set %>% pull(claim_ind)
+cutoff <- mean(y)
+lambdas <- 10^seq(2, -3, by = -.1)
+lasso_fit <- cv.glmnet(x = x, y = y, 
+                    alpha = 1,
+                    lamda = lamdas,
+                    standardize = TRUE, 
+                    nfolds = 5,
+                    weights = ifelse(train_prep$claim_ind == "no", 1, 13), 
+                    family = "binomial", parallel = TRUE)
+lambda_best_bin <- lasso_fit$lambda.min
+
+lasso_model <- glmnet(x, y, alpha = 1, lambda = lambda_best_bin, standardize = TRUE)
+
+lasso_preds_train <- predict(lasso_model, s = lambda_best, newx = x)
+lasso_preds_train <- 1*(lasso_preds_train[,1] >= mean(y))
+library(MLmetrics)
+Accuracy(lasso_preds_train, y)
+AUC(lasso_preds_train, y)
+
+train_2 <- train_set %>% filter(claim_ind == 1)
+
+step_prep_2 <- recipe(claim_cost ~ veh_value + exposure + veh_body + veh_age + gender + area + dr_age,
+                      data = train_2) %>% 
+  step_log(veh_value, claim_cost, offset = 1) %>% 
+  step_dummy(all_nominal()) %>% 
+  step_interact(~ starts_with("veh_body"):starts_with("gender") + 
+                  starts_with("veh_body"):starts_with("area") +
+                  starts_with("veh_body"):veh_value + 
+                  starts_with("veh_body"):exposure +
+                  starts_with("veh_body"):veh_age + 
+                  starts_with("veh_body"):dr_age +
+                  starts_with("gender"):starts_with("area") + 
+                  starts_with("gender"):veh_value +
+                  starts_with("gender"):exposure + 
+                  starts_with("gender"):veh_age +
+                  starts_with("gender"):dr_age + 
+                  starts_with("area"):veh_value +
+                  starts_with("area"):exposure + 
+                  starts_with("area"):veh_age + 
+                  starts_with("area"):dr_age +
+                  veh_value:exposure + 
+                  veh_value:veh_age + 
+                  veh_value:dr_age + 
+                  exposure:veh_age +
+                  exposure:dr_age + 
+                  veh_age:dr_age) %>% 
+  step_poly(veh_value, exposure, veh_age, dr_age) %>% 
+  prep(training = train_2)
+
+train_prep_2 <- juice(step_prep_2)
+test_prep_2 <- bake(step_prep_2, new_data = eval_set)
+
+# linear regression
+x <- train_prep_2 %>% select(-claim_cost) %>% as.matrix()
+y <- train_2 %>% pull(claim_cost)
+y <- log(y + 1)
+lambdas <- 10^seq(2, -3, by = -.1)
+lasso_fit <- cv.glmnet(x = x, y = y, 
+                    alpha = 1,
+                    lamda = lamdas,
+                    standardize = TRUE, 
+                    nfolds = 5,
+                    family = "gaussian", parallel = TRUE)
+lambda_best_cont <- lasso_fit$lambda.min
+lasso_model_2 <- glmnet(x, y, alpha = 1, lambda = lambda_best_cont, standardize = TRUE)
+lasso_preds_train <- predict(lasso_model_2, s = lambda_best_cont, newx = x)
+RMSE(lasso_preds_train[,1], y)
+Gini(lasso_preds_train[,1], y)
+
+newx <- test_prep %>% select(-claim_ind) %>% as.matrix()
+lasso_preds_bin <- predict(lasso_model, s = lambda_best_bin, newx = newx)
+lasso_preds_bin <- lasso_preds_bin[,1] >= cutoff
+
+y_output <- eval_set[!lasso_preds_bin,] %>% 
+  mutate(y_true = claim_cost, y_pred = 0) %>% 
+  select(y_true, y_pred)
+
+test_2 <- test_prep_2[lasso_preds_bin,]
+newx <- test_2 %>% select(-claim_cost) %>% as.matrix()
+lasso_preds_cont <- predict(lasso_model_2, s = lambda_best_cont, newx = newx)
+lasso_preds_cont <- exp(lasso_preds_cont) - 1
+
+tmp <- data.frame(y_true = test_2$claim_cost, 
+                  y_pred = lasso_preds_cont[,1])
+y_output <- bind_rows(y_output, tmp)
+
+Gini(y_output$y_pred, y_output$y_true)
+
+```
