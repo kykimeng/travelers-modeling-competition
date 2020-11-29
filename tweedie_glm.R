@@ -62,13 +62,13 @@ tweedie_reg[which.max(tweedie_reg$gini)]
 
 tweedie_model <- glm(claim_cost ~ veh_value + veh_value_sq + veh_body + factor(veh_age) + 
                        gender + area + factor(dr_age),
-                     data = train_full, 
+                     data = train_set, 
                      family = tweedie(var.power = 1.64, link.power = 0),
                      offset = exposure)
 summary(tweedie_model)
 
-y_pred <- predict(tweedie_model, type = "response")
-MLmetrics::Gini(y_pred = y_pred, y_true = train_full$claim_cost)
+y_pred <- predict(tweedie_model, type = "response", newdata = eval_set)
+MLmetrics::Gini(y_pred = y_pred, y_true = eval_set$claim_cost)
 
 ggplot() + 
   geom_histogram(aes(x =  y_pred), binwidth = 50, fill = "red") +
@@ -79,3 +79,14 @@ ggplot() +
 y_test <- predict(tweedie_model, newdata = test_set, type = "response")
 tweedie_out <- data.frame(id = 1:nrow(test_set), claim_cost = y_test)
 fwrite(tweedie_out, "tweedie_predictions.csv")
+
+# cplm ----
+library(cplm)
+
+m0 <- cpglm(claim_cost ~ veh_value + veh_body + factor(veh_age) + 
+              gender + area + factor(dr_age),
+            data = train_full, 
+            offset = exposure)
+c(coef(m0), p = m0$p, phi = m0$phi)
+y_pred <- predict(m0, type = "response", newdata = eval_set)
+MLmetrics::Gini(y_pred = y_pred, y_true = eval_set$claim_cost)
